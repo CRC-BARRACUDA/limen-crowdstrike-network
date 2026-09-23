@@ -1,0 +1,95 @@
+# Ukrainian strings for the module's own screens.
+#
+# `[module]` is read by the *host* for the card and the tab; everything else is
+# read by the module for its own screens.
+
+[module]
+title = "Мережа парку"
+description = "Показує мережеві інтерфейси на хостах парку CrowdStrike через RTR — адреси, MAC, шлюзи, DNS і стан з'єднання для кожного хоста."
+
+[ui]
+title = "Мережа парку"
+subtitle = "Усі інтерфейси кожного хоста, зчитані через RTR — адреси, MAC, шлюзи, DNS і стан з'єднання."
+fetch_hosts = "Отримати хости"
+scan_selected = "Сканувати вибрані"
+scan_all = "Сканувати всі"
+stop = "Зупинити"
+search = "Пошук"
+search_hint = "адреса, MAC, назва…"
+filter = "Фільтрувати"
+reachable = "Доступні хости ({n}) — позначте ті, які сканувати"
+no_reachable = "Доступних хостів немає. Для RTR хост має бути в мережі."
+scanned = "Проскановано ({n}) — подвійний клік на хості відкриє його інтерфейси"
+open_host = "Відкрити інтерфейси"
+not_scanned = "Не проскановано ({n})"
+col_host = "Хост"
+col_why = "Причина"
+shown_of = "показано {shown} з {total}"
+no_match = "Нічого не знайдено."
+
+[state]
+queued = "очікує"
+scanning = "сканування…"
+done = "готово"
+failed = "помилка"
+stopped = "зупинено"
+skipped = "ОС не підтримується"
+failed_why = "помилка — {why}"
+
+[status]
+reachable = "Доступних хостів: {n}"
+fetch_failed = "не вдалося отримати список: {err}"
+none_selected = "не вибрано жодного хоста — позначте хоча б один"
+already_running = "сканування вже триває"
+starting = "сканування {n} хост(ів)…"
+progress = "сканування — {done} з {total} готово, інтерфейсів поки що: {items}"
+scanned = "проскановано хостів: {n}"
+items = "інтерфейсів: {n}"
+failed = "з помилкою: {n}"
+stopped = "зупинено: {n}"
+unsupported = "не підтримується: {n}"
+stopping = "зупиняємо — хости, вже в роботі, завершаться"
+
+[host]
+unknown = "Цього хоста немає в останньому скануванні."
+summary = "інтерфейсів: {n}"
+up = "Активні ({n})"
+notup = "Неактивні ({n})"
+nothing_up = "Активних немає."
+everything_up = "Усі активні."
+
+[col]
+iface = "Інтерфейс"
+type = "Тип"
+state = "Стан"
+mac = "MAC"
+ipv4 = "IPv4"
+ipv6 = "IPv6"
+gateway = "Шлюз"
+dns = "DNS"
+
+[iface]
+about = "Про інтерфейс"
+gone = "Цього інтерфейсу вже немає в останньому скануванні."
+window = "Інтерфейс"
+unnamed = "(без назви)"
+is_up = "Активний"
+is_down = "Неактивний ({state})"
+host = "Хост"
+type = "Тип"
+mac = "MAC"
+ipv4 = "IPv4"
+ipv6 = "IPv6"
+gateway = "Шлюз"
+dns = "DNS"
+speed = "Швидкість з'єднання"
+falcon_id = "Ідентифікатор хоста Falcon"
+
+[ui2]
+col_ifaces = "Інтерфейсів"
+col_up = "Активних"
+col_addrs = "Адрес"
+
+[note]
+truncated = "понад {n} інтерфейсів — список скорочено"
+empty = "хост не повідомив про мережеві інтерфейси"
