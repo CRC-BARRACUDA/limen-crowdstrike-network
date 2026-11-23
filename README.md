@@ -47,10 +47,40 @@ whole script. No files are written and no window is opened. Anything that went
 wrong travels back as data — a note on that host's row — not onto somebody's
 screen.
 
-Read-only: the interface, route and resolver tables are read and nothing is
-changed. But read-only is a property of the script, not of the permission, so the
-permission stays the honest one — `run_hosts`. **This executes code on your
-fleet.**
+The fleet scan is read-only: the interface, route and resolver tables are read
+and nothing is changed. **The host panel can change interfaces through this
+module** — see *Changing interfaces* below — so the permission is the honest one,
+`run_hosts`. **This executes code on your fleet, and some of it changes how a host
+reaches the network.**
+
+## Changing interfaces
+
+Asked by the host panel, never on its own, and never one change at a time: the
+user drafts changes, and Apply opens a window listing every one before anything
+is sent.
+
+* `check` validates drafted changes and sends nothing. Every value is parsed as
+  what it claims to be — an IPv4 address with its prefix, a list of DNS servers,
+  a metric from 1 to 9999 — and never pasted into a script as typed; interface
+  names are quoted for PowerShell or the shell, and refused if they could not be.
+* `change` makes them, each as a pass of its own over **one** RTR session, then
+  reads the host again in the same session. Changes to the interface the host
+  reaches the network through go **last**: if one of them cuts the host off,
+  everything else has been done. A change that never reported back is reported
+  as not applied — which is what losing the host looks like from here.
+
+| | Windows | Linux |
+|---|---|---|
+| address, gateway | `netsh interface ipv4 set address` — static or DHCP, written to the saved settings, so it works on an unplugged adapter too | `ip addr`, `ip route` |
+| DNS | `Set-DnsClientServerAddress`, or from DHCP | `resolvectl` (systemd-resolved only) |
+| metric | `Set-NetIPInterface` | the default route's metric |
+| network profile | `Set-NetConnectionProfile` — Private or Public; a domain network is the domain's | — |
+| disconnect, connect | `Disable-`/`Enable-NetAdapter` | `ip link set down/up` |
+| delete | virtual adapters: the Hyper-V switch, else `pnputil /remove-device` | virtual interfaces |
+| create | a Hyper-V internal switch (needs Hyper-V); no supported way to make a bridge | a bridge, or a virtual (dummy) interface |
+
+macOS hosts are read, not changed. On Linux, `ip` changes last until reboot, and
+NetworkManager may put its own settings back.
 
 ## It needs no privileges on your own machine
 
@@ -74,7 +104,17 @@ network                        -> the last scan as data
 network {"address": "10.1.2."} -> any interface whose IPv4/IPv6 starts with that
 network {"mac": "00:1a"}       -> any interface whose MAC starts with that
 network {"up": false}          -> only what is not up
+read_host {"id", "hostname", "platform"}
+                               -> read one host on request (the host panel's Network)
 ```
+
+`read_host` reads one machine apart from the fleet scan — it neither wipes what
+the fleet screen shows nor waits for it — and answers at once: `scanning` (with
+`elapsed` seconds) until the read is done, then a screen-ready answer in Limen's
+language: the interfaces that are up and the ones that are not, as two tables.
+`refresh: true` reads again; `start: false` only reports a read taken before, for
+a host that is offline. A finished read is kept, failures included, so a caller
+that polls never starts a new read per poll.
 
 The address and MAC lookups are the shape of the question actually asked of this
 data — *which host is this?* — so the MAC match ignores separators: a search need

@@ -16,8 +16,9 @@ session per host rather than one batch across many is the point of the screen: a
 batch returns when its slowest member does, while here each host lands on its own
 and can be opened while the rest are still going.
 
-Read-only: the interface, route and resolver tables are read and nothing is
-changed.
+The fleet scan is read-only: the interface, route and resolver tables are read
+and nothing is changed. Interfaces are changed only when the host panel asks —
+`check` and `change`, below — after the user has accepted every change.
 
 What it reads
 -------------
@@ -45,10 +46,15 @@ Methods
   open_host       -> one host's interfaces, in a tab (the double-click target)
   about           -> one interface, in a tab
   network         -> the same data as JSON, for other modules
+  read_host       -> read one host on request, for the host panel
+  check           -> check drafted interface changes, sending nothing
+  change          -> make drafted interface changes on one host, then read it
 """
 
+import ipaddress
 import json
 import os
+import re
 import queue
 import threading
 import time
@@ -110,6 +116,11 @@ _status = {"msg": ""}
 #   state: "queued" | "scanning" | "done" | "failed" | "stopped"
 _jobs = {}
 _lock = threading.Lock()
+
+# One-host reads asked for by another module — the host panel — by device id.
+# Kept apart from `_jobs`: asking about one machine must neither wipe what the
+# fleet screen is showing nor wait for a fleet scan to finish. Same lock.
+_reads = {}
 
 # Workers must not log through `host`: the SDK's host bridge writes a frame to
 # stdout and then reads stdin, and that is the JSON-RPC pipe. A second thread
@@ -196,7 +207,7 @@ def _auth(host):
     return token, base
 
 
-def _rtr_one(hid, platform, token, base, stop):
+def _rtr_one(hid, platform, token, base, stop, before=()):
     """Enumerate ONE host and return its stdout.
 
     One RTR session per host rather than one batch across many: a batch returns
@@ -212,7 +223,9 @@ def _rtr_one(hid, platform, token, base, stop):
         raise _Stopped()
     # Chosen first, so a host whose OS we cannot read costs no RTR session and
     # nothing is run on it.
-    passes = _script_for(platform)
+    # Changes, when there are any, go first: the read after them is then of the
+    # host as the changes left it.
+    passes = list(before) + _script_for(platform)
     st, init = _http(
         "POST",
         f"{base}/real-time-response/combined/batch-init-session/v1",
@@ -354,17 +367,48 @@ foreach ($r in @(Get-NetRoute -DestinationPrefix '::/0')) {
   Add $gw ([string]$r.InterfaceIndex) (Clean $r.NextHop)
 }
 foreach ($d in @(Get-DnsClientServerAddress)) {
-  foreach ($srv in @($d.ServerAddresses)) { Add $dns ([string]$d.InterfaceIndex) (Clean $srv) }
+  foreach ($srv in @($d.ServerAddresses)) {
+    if ([string]$srv -like 'fec0:0:0:ffff::*') { continue }
+    Add $dns ([string]$d.InterfaceIndex) (Clean $srv)
+  }
+}
+# What the edit form shows as it is now: the profile (Private, Public, or set by
+# the domain), the IPv4 metric and whether it is automatic, and DHCP.
+$cat = @{}
+foreach ($p in @(Get-NetConnectionProfile)) { $cat[[string]$p.InterfaceIndex] = Clean $p.NetworkCategory }
+$met = @{}
+$amet = @{}
+$dh = @{}
+foreach ($i in @(Get-NetIPInterface -AddressFamily IPv4)) {
+  $j = [string]$i.InterfaceIndex
+  $met[$j] = Clean $i.InterfaceMetric
+  $amet[$j] = Clean $i.AutomaticMetric
+  $dh[$j] = Clean $i.Dhcp
 }
 foreach ($a in $adapters) {
   $k = [string]$a.ifIndex
+  # The saved settings, where Properties reads them and netsh writes them: in
+  # force once the adapter is connected, which on an unplugged one they are not.
+  # DNS typed in is in NameServer; with it empty, DNS comes from DHCP.
+  $cf = Get-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\' + $a.InterfaceGuid)
+  $dsrc = ''
+  if ($cf) { $dsrc = 'dhcp'; if ($cf.NameServer) { $dsrc = 'static' } }
+  if ($cf.EnableDHCP -eq 1) { $ips = @($cf.DhcpIPAddress); $ms = @($cf.DhcpSubnetMask); $gs = @($cf.DhcpDefaultGateway) }
+  else { $ips = @($cf.IPAddress); $ms = @($cf.SubnetMask); $gs = @($cf.DefaultGateway) }
+  $cv = @()
+  for ($x = 0; $x -lt $ips.Count; $x++) { if ($ips[$x] -and $ips[$x] -ne '0.0.0.0') { $cv += ($ips[$x] + '/' + $ms[$x]) } }
+  $cd = $cf.NameServer
+  if (-not $cd) { $cd = $cf.DhcpNameServer }
   $kind = Clean $a.PhysicalMediaType
   if (-not $kind -or $kind -eq 'Unspecified') { $kind = 'net' }
   if ($a.Virtual) { $kind = 'virtual' }
   $state = Clean $a.Status
   $speed = Clean $a.LinkSpeed
   Emit (@((Clean $a.Name), $kind, (Clean $a.MacAddress), (Clean $ip4[$k]), (Clean $ip6[$k]),
-          (Clean $gw[$k]), (Clean $dns[$k]), $state, $speed) -join '|')
+          (Clean $gw[$k]), (Clean $dns[$k]), $state, $speed,
+          (Clean $cat[$k]), (Clean $met[$k]), (Clean $amet[$k]), (Clean $dh[$k]), $dsrc,
+          (Clean $cf.EnableDHCP), (Clean ($cv -join ' ')), (Clean ($gs -join ' ')),
+          (Clean ([string]$cd -replace ',', ' '))) -join '|')
 }
 } catch { Write-Output ('#err=' + ($_.Exception.Message -replace '[\r\n\|]', ' ')) }
 """
@@ -503,29 +547,42 @@ def _script_for(platform, limit=MAX_ROWS_PER_HOST):
     if which is None:
         raise _UnknownOS(platform or "(not reported)")
     bodies = globals()
-    out = []
-    for label, name in _PASSES[which]:
-        body = bodies[name]
+    return [_ready(label, platform, bodies[name].replace("__LIMIT__", str(int(limit))))
+            for label, name in _PASSES[which]]
+
+
+def _ready(label, platform, body):
+    """A script as it goes on the wire, checked."""
     # This file is checked out with CRLF, so the literals above carry \r on
     # every line. PowerShell copes; /bin/sh does not — `LIMIT=400\r` compares
     # against a value with a carriage return in it and every `done` becomes an
     # unknown command. So the script is normalised to LF whichever platform it is
     # for, rather than leaving it to how this file happens to be checked out.
-        script = _minify(body.replace("__LIMIT__", str(int(limit)))).replace("\r\n", "\n")
+    script = _minify(body).replace("\r\n", "\n")
         # The script is sent inside an RTR ```…``` block, so a backtick anywhere
         # in it — including in a comment written out of Markdown habit — closes
         # that block early and corrupts the command on the wire. It fails as a
         # script that does not run rather than as an error anybody sees, so it is
         # caught here instead.
-        if "`" in script:
-            bad = next(n for n, ln in enumerate(script.splitlines(), 1) if "`" in ln)
-            raise AssertionError(f"backtick in {label} for {platform}, line {bad}")
-        if len(script) > MAX_SCRIPT_BYTES:
-            raise AssertionError(
-                f"{label} for {platform} is {len(script)}B, over the "
-                f"{MAX_SCRIPT_BYTES}B a single runscript may carry — split it")
-        out.append((label, script))
-    return out
+    if "`" in script:
+        bad = next(n for n, ln in enumerate(script.splitlines(), 1) if "`" in ln)
+        raise AssertionError(f"backtick in {label} for {platform}, line {bad}")
+    if len(script) > MAX_SCRIPT_BYTES:
+        raise AssertionError(
+            f"{label} for {platform} is {len(script)}B, over the "
+            f"{MAX_SCRIPT_BYTES}B a single runscript may carry — split it")
+    return label, script
+
+
+def _with_prefix(pairs):
+    """`ip/255.255.255.0` pairs, as the registry keeps them, as `ip/24`."""
+    out = []
+    for pair in pairs.split():
+        try:
+            out.append(str(ipaddress.IPv4Interface(pair)))
+        except ValueError:
+            continue
+    return " ".join(out)
 
 
 def _parse(stdout, hostname, host_id):
@@ -536,7 +593,8 @@ def _parse(stdout, hostname, host_id):
     seeing, and on a busy host those outnumber the physical adapters — so they
     are labelled rather than filtered, and the screen groups by state instead.
     """
-    rows, flags = [], {"truncated": False, "error": "", "legacy": False}
+    rows, flags = [], {"truncated": False, "error": "", "legacy": False,
+                       "changed": [], "change_failed": {}}
     for line in (stdout or "").splitlines():
         line = line.strip()
         if not line:
@@ -551,12 +609,27 @@ def _parse(stdout, hostname, host_id):
             elif line.startswith("#err="):
                 # The endpoint stayed silent and told us instead.
                 flags["error"] = line[5:].strip()
+            elif line.startswith("#changed="):
+                flags["changed"].append(int(line[9:].strip() or -1))
+            elif line.startswith("#change-failed="):
+                at, _, err = line[15:].partition(":")
+                if at.strip().isdigit():
+                    flags["change_failed"][int(at)] = err.strip()
             continue
         parts = [f.strip() for f in line.split("|")]
         if len(parts) < 8:
             continue
         iface, kind, mac, v4, v6, gw, dns, state = parts[:8]
         speed = parts[8] if len(parts) > 8 else ""
+        # Windows only, and not from the legacy path: the network profile, the
+        # interface metric and whether it is automatic, DHCP, and where the DNS
+        # servers come from.
+        profile, metric, auto_metric, dhcp, dns_from = (parts[9:14] + [""] * 5)[:5]
+        # And the saved settings — what the adapter will use once connected,
+        # which on an unplugged one is not what is in force.
+        cfg_dhcp, cfg_v4, cfg_gw, cfg_dns = (parts[14:18] + [""] * 4)[:4]
+        if cfg_dhcp.strip() in ("0", "1"):
+            dhcp = "enabled" if cfg_dhcp.strip() == "1" else "disabled"
         if not iface:
             continue
         rows.append({
@@ -574,6 +647,20 @@ def _parse(stdout, hostname, host_id):
             "dns": " ".join(dns.split()),
             "state": (state or "").lower(),
             "speed": speed,
+            "profile": profile,
+            "metric": metric,
+            "auto_metric": auto_metric.lower() == "enabled",
+            "dhcp": dhcp.lower() == "enabled",
+            # DNS from DHCP: nothing typed in, on an interface that has DHCP to
+            # get it from. Without DHCP, an empty list is just no servers.
+            "dns_auto": dns_from == "dhcp" and dhcp.lower() == "enabled",
+            # Whether the saved settings were read at all. An empty saved
+            # gateway is "none", not "unknown" — only without them does what
+            # is in force stand in.
+            "saved": cfg_dhcp.strip() in ("0", "1"),
+            "cfg_ipv4": _with_prefix(cfg_v4),
+            "cfg_gateway": " ".join(g for g in cfg_gw.split() if ":" not in g),
+            "cfg_dns": " ".join(cfg_dns.split()),
             # What an operator actually searches for: "is this MAC on the fleet",
             # "who has 10.1.2.3". Both live behind a normalisation, so the search
             # box can match either without the user matching the host's spelling.
@@ -599,20 +686,16 @@ def _set(hid, **fields):
             job.update(fields)
 
 
-def _worker(hid, token, base, stop):
-    """Enumerate one host. Runs on a pool thread; touches only `_jobs` (locked),
-    `_logq`, and the network."""
-    with _lock:
-        job = _jobs.get(hid)
-        if job is None:
-            return
-        hostname, platform = job["hostname"], job["platform"]
-    if stop.is_set():
-        _set(hid, state="stopped")
-        return
-    _set(hid, state="scanning")
+def _read(hid, hostname, platform, token, base, stop, before=()):
+    """Read one host's interfaces over RTR, and say how it ended.
+
+    Returns the fields of a finished read: `state`, with `ifaces` and `notes`
+    when it is `done`, or `error` when it is not. Shared by the fleet scan and
+    the one-host read another module asks for, so both read a machine the same
+    way. Runs on a worker thread; touches only `_logq` and the network.
+    """
     try:
-        stdout = _rtr_one(hid, platform, token, base, stop)
+        stdout = _rtr_one(hid, platform, token, base, stop, before)
         rows, flags = _parse(stdout, hostname, hid)
         notes = []
         if flags["truncated"]:
@@ -624,16 +707,32 @@ def _worker(hid, token, base, stop):
             notes.append(flags["error"])
         if not rows and not notes:
             notes.append(t("note.empty"))
-        _set(hid, state="done", ifaces=rows, notes=notes)
         _log(f"cs-network: {hostname} — {len(rows)} interface(s)")
+        return {"state": "done", "ifaces": rows, "notes": notes,
+                "changed": flags["changed"], "change_failed": flags["change_failed"]}
     except _Stopped:
-        _set(hid, state="stopped")
+        return {"state": "stopped"}
     except _UnknownOS as exc:
-        _set(hid, state="skipped", error=str(exc))
         _log(f"cs-network: {hostname} skipped — {exc}")
+        return {"state": "skipped", "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
-        _set(hid, state="failed", error=str(exc))
         _log(f"cs-network: {hostname} failed — {exc}")
+        return {"state": "failed", "error": str(exc)}
+
+
+def _worker(hid, token, base, stop):
+    """Enumerate one host of a fleet scan. Runs on a pool thread; touches only
+    `_jobs` (locked), `_logq`, and the network."""
+    with _lock:
+        job = _jobs.get(hid)
+        if job is None:
+            return
+        hostname, platform = job["hostname"], job["platform"]
+    if stop.is_set():
+        _set(hid, state="stopped")
+        return
+    _set(hid, state="scanning")
+    _set(hid, **_read(hid, hostname, platform, token, base, stop))
 
 
 def _start(host, targets):
@@ -907,6 +1006,551 @@ def open_host(params, host):
                   on_activate=(CAP, "about"))
             if down else Label(t("host.everything_up"), style="weak"))
     return Window(name, widgets).to_spec()
+
+
+# --------------------------------------------------------------------------- #
+# Changing interfaces — on request, from the host panel.
+# --------------------------------------------------------------------------- #
+# The panel keeps the user's changes as a draft and sends them here only when
+# Apply is accepted. They are checked here first — every value parsed as what it
+# claims to be, never pasted into a script as typed — then each becomes a pass
+# of its own over one RTR session, and the host is read again in the same
+# session, so the screen shows what the changes did.
+
+# What a change may touch, per platform. macOS is read but not changed.
+_EDIT_FIELDS = {
+    "win": ("ipv4", "dhcp", "gateway", "dns", "dns_auto", "metric", "profile"),
+    "linux": ("ipv4", "gateway", "dns", "metric"),
+}
+# What can be created. Windows has one built-in way to make an interface, a
+# Hyper-V internal switch (its vEthernet adapter); no supported way to make a
+# bridge. Linux makes both a bridge and a plain virtual (dummy) interface.
+_ADD_KINDS = {"win": ("switch",), "linux": ("bridge", "dummy")}
+_PROFILES = ("Private", "Public")
+
+
+class _Bad(ValueError):
+    """A change that cannot be sent: the message says why, in the user's words."""
+
+
+def _family(platform):
+    p = (platform or "").strip().lower()
+    return next((kind for prefix, kind in _SCRIPTS if p.startswith(prefix)), None)
+
+
+def actions_for(platform):
+    """What can be changed on a host of this platform. Empty on macOS."""
+    fam = _family(platform)
+    if fam not in _EDIT_FIELDS:
+        return {}
+    return {"edit": list(_EDIT_FIELDS[fam]), "toggle": True, "delete": True,
+            "add": list(_ADD_KINDS[fam])}
+
+
+def _iface(s):
+    s = str(s or "").strip()
+    if not s or len(s) > 256 or any(c in s for c in "`|\r\n\0"):
+        raise _Bad(t("change.bad_iface"))
+    return s
+
+
+def _new_name(s, fam):
+    s = str(s or "").strip()
+    pattern = r"[A-Za-z0-9_.-]{1,15}" if fam == "linux" else r"[A-Za-z0-9 _.()-]{1,64}"
+    if not re.fullmatch(pattern, s):
+        raise _Bad(t("change.bad_name_" + fam))
+    return s
+
+
+def _v4_cidr(s):
+    s = str(s or "").strip()
+    try:
+        net = ipaddress.IPv4Interface(s)
+    except ValueError:
+        raise _Bad(t("change.bad_ipv4", v=s)) from None
+    if "/" not in s or not 1 <= net.network.prefixlen <= 32:
+        raise _Bad(t("change.bad_ipv4", v=s))
+    return str(net)
+
+
+def _v4(s):
+    s = str(s or "").strip()
+    try:
+        return str(ipaddress.IPv4Address(s))
+    except ValueError:
+        raise _Bad(t("change.bad_gateway", v=s)) from None
+
+
+def _dns(s):
+    parts = [p for p in re.split(r"[,\s]+", str(s or "").strip()) if p]
+    if not 1 <= len(parts) <= 8:
+        raise _Bad(t("change.bad_dns", v=s))
+    try:
+        return [str(ipaddress.ip_address(p)) for p in parts]
+    except ValueError:
+        raise _Bad(t("change.bad_dns", v=s)) from None
+
+
+def _metric(s):
+    s = str(s if s is not None else "").strip()
+    if not s:
+        return None  # automatic
+    if not s.isdigit() or not 1 <= int(s) <= 9999:
+        raise _Bad(t("change.bad_metric", v=s))
+    return int(s)
+
+
+def _truth(v):
+    return v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _normalize(change, platform):
+    """One drafted change, checked and made exact — and what it says, in words.
+
+    Raises `_Bad` with the reason when it cannot be sent as it is.
+    """
+    fam = _family(platform)
+    acts = actions_for(platform)
+    if not acts:
+        raise _Bad(t("change.unsupported", platform=platform or "?"))
+    op = change.get("op")
+    if op == "add":
+        kind = change.get("kind")
+        if kind not in acts["add"]:
+            raise _Bad(t("change.bad_kind"))
+        name = _new_name(change.get("name"), fam)
+        return {"op": "add", "kind": kind, "name": name}, t("change.add_" + kind, name=name)
+    iface = _iface(change.get("iface"))
+    if op in ("disable", "enable", "delete"):
+        return {"op": op, "iface": iface}, t("change." + op, iface=iface)
+    if op != "edit":
+        raise _Bad(t("change.bad_op"))
+    given = change.get("values") or {}
+    vals, said = {}, []
+    for key in acts["edit"]:
+        if key not in given:
+            continue
+        raw = given[key]
+        if key == "ipv4":
+            vals[key] = _v4_cidr(raw)
+            said.append(t("change.f_ipv4", v=vals[key]))
+        elif key == "gateway":
+            vals[key] = _v4(raw) if str(raw or "").strip() else ""
+            said.append(t("change.f_gateway", v=vals[key]) if vals[key] else t("change.f_no_gateway"))
+        elif key == "dns":
+            vals[key] = _dns(raw)
+            said.append(t("change.f_dns", v=", ".join(vals[key])))
+        elif key == "metric":
+            vals[key] = _metric(raw)
+            said.append(t("change.f_metric", v=vals[key]) if vals[key] else t("change.f_metric_auto"))
+        elif key == "profile":
+            if raw not in _PROFILES:
+                raise _Bad(t("change.bad_profile"))
+            vals[key] = raw
+            said.append(t("change.f_profile_" + raw.lower()))
+        elif key in ("dhcp", "dns_auto"):
+            if _truth(raw):
+                vals[key] = True
+                said.append(t("change.f_" + key))
+    if vals.get("dhcp") and "ipv4" in vals:
+        raise _Bad(t("change.dhcp_and_static"))
+    if vals.get("dns_auto") and "dns" in vals:
+        raise _Bad(t("change.dns_auto_and_list"))
+    if not vals:
+        raise _Bad(t("change.nothing"))
+    return ({"op": "edit", "iface": iface, "values": vals},
+            t("change.edit", iface=iface, what="; ".join(said)))
+
+
+def _ps(s):
+    """A PowerShell string literal. Single-quoted strings expand nothing; the only
+    character to escape is the quote itself."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _sh(s):
+    """A POSIX shell string literal, for the same reason."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+_WIN_CHANGE = r"""
+Write-Output '#begin'
+$ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+try {
+__BODY__
+Write-Output '#changed=__I__'
+} catch { Write-Output ('#change-failed=__I__:' + ($_.Exception.Message -replace '[\r\n\|]', ' ')) }
+"""
+
+_SH_CHANGE = r"""
+echo '#begin'
+fail() { printf '#change-failed=__I__:%s\n' "$(printf '%s' "$1" | tr '\n|' '  ')"; exit 0; }
+run() { out=$("$@" 2>&1) || fail "$out"; }
+__BODY__
+echo '#changed=__I__'
+"""
+
+
+def _win_body(c):
+    op = c["op"]
+    if op == "add":
+        return "\n".join([
+            "if (-not (Get-Command New-VMSwitch -ErrorAction SilentlyContinue)) "
+            "{ throw 'Hyper-V is not installed on this host, and Windows has no other "
+            "built-in way to create an interface' }",
+            f"New-VMSwitch -Name {_ps(c['name'])} -SwitchType Internal | Out-Null",
+        ])
+    out = [f"$n = {_ps(c['iface'])}", "$a = Get-NetAdapter -Name $n -IncludeHidden"]
+    if op == "disable":
+        out.append("Disable-NetAdapter -Name $n -Confirm:$false")
+    elif op == "enable":
+        out.append("Enable-NetAdapter -Name $n -Confirm:$false")
+    elif op == "delete":
+        out += [
+            "if (-not $a.Virtual) { throw 'only a virtual interface can be deleted' }",
+            "$sw = $null",
+            "if ($n -match '^vEthernet \\((.+)\\)$' -and (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue)) "
+            "{ $sw = Get-VMSwitch -Name $Matches[1] -ErrorAction SilentlyContinue }",
+            "if ($sw) { Remove-VMSwitch -Name $sw.Name -Force } else {",
+            "  $o = (pnputil /remove-device $a.PnPDeviceID) -join ' '",
+            "  if ($LASTEXITCODE -ne 0) { throw ('pnputil: ' + $o) }",
+            "}",
+        ]
+    elif op == "edit":
+        v = c["values"]
+        # Address, mask, gateway and DHCP through netsh, in one call. Windows
+        # keeps an interface's settings twice — what is in force, and what is
+        # saved for the next start — and the NetTCPIP cmdlets change them
+        # separately: on an adapter that is not connected, turning DHCP off
+        # reaches only the first, and New-NetIPAddress then refuses with
+        # "Inconsistent parameters PolicyStore PersistentStore and Dhcp
+        # Enabled". netsh writes the saved settings, connected or not, and
+        # turns DHCP off as part of setting an address. The interface goes by
+        # its index, so a name with spaces needs no quoting.
+        out.append("$i = $a.ifIndex")
+        if v.get("dhcp"):
+            out.append(_netsh("set address name=$i source=dhcp"))
+        elif "ipv4" in v:
+            net = ipaddress.IPv4Interface(v["ipv4"])
+            gateway = f"gateway={v['gateway']}" if v.get("gateway") else "gateway=none"
+            out.append(_netsh(f"set address name=$i source=static address={net.ip} "
+                              f"mask={net.netmask} {gateway}"))
+        if v.get("dns_auto"):
+            out.append("Set-DnsClientServerAddress -InterfaceAlias $n -ResetServerAddresses")
+        elif "dns" in v:
+            out.append("Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @("
+                       + ",".join(_ps(d) for d in v["dns"]) + ")")
+        if "metric" in v:
+            out.append("Set-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -AutomaticMetric Enabled"
+                       if v["metric"] is None else
+                       f"Set-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -InterfaceMetric {int(v['metric'])}")
+        if "profile" in v:
+            out.append(f"Set-NetConnectionProfile -InterfaceAlias $n -NetworkCategory {v['profile']}")
+    return "\n".join(out)
+
+
+def _netsh(args):
+    """A netsh interface ipv4 call, and a failure of it as an exception: netsh
+    reports by exit code and prints its reason, so both are caught here."""
+    return (f"$o = (netsh interface ipv4 {args} 2>&1) -join ' '\n"
+            "if ($LASTEXITCODE -ne 0) { throw ('netsh: ' + $o) }")
+
+
+def _complete(c, hid):
+    """An edit made whole for the script.
+
+    netsh sets an address and its gateway together, so a change to only one of
+    them is sent with the other as the host last had it — read, not guessed.
+    An address cannot be kept that the host was never seen to have.
+    """
+    v = c.get("values") or {}
+    if c.get("op") != "edit" or v.get("dhcp") or ("ipv4" not in v and "gateway" not in v):
+        return c
+    with _lock:
+        known = (_reads.get(hid) or {}).get("ifaces") or []
+    r = next((x for x in known if x.get("iface") == c["iface"]), {})
+    # The saved settings first: that is what netsh changes, and on an adapter
+    # that is not connected, what is in force is only DHCP's stand-in.
+    if r.get("saved"):
+        have4 = (r.get("cfg_ipv4") or "").split()
+        have_gw = (r.get("cfg_gateway") or "").split()
+    else:
+        have4 = [a for a in (r.get("ipv4") or "").split() if ":" not in a and "/" in a]
+        have_gw = [g for g in (r.get("gateway") or "").split() if ":" not in g]
+    v = dict(v)
+    if "ipv4" not in v:
+        if not have4:
+            raise _Bad(t("change.need_address", iface=c["iface"]))
+        v["ipv4"] = have4[0]
+    if "gateway" not in v:
+        v["gateway"] = have_gw[0] if have_gw else ""
+    return {**c, "values": v}
+
+
+def _sh_body(c):
+    op = c["op"]
+    if op == "add":
+        return "\n".join([
+            f"run ip link add name {_sh(c['name'])} type {'bridge' if c['kind'] == 'bridge' else 'dummy'}",
+            f"run ip link set dev {_sh(c['name'])} up",
+        ])
+    out = [f"n={_sh(c['iface'])}",
+           '[ -e "/sys/class/net/$n" ] || fail "there is no interface $n"']
+    if op == "disable":
+        out.append('run ip link set dev "$n" down')
+    elif op == "enable":
+        out.append('run ip link set dev "$n" up')
+    elif op == "delete":
+        out += ['[ -e "/sys/class/net/$n/device" ] && fail "only a virtual interface can be deleted"',
+                'run ip link delete dev "$n"']
+    elif op == "edit":
+        v = c["values"]
+        if "ipv4" in v:
+            out += ['run ip addr flush dev "$n" scope global',
+                    f'run ip addr add {_sh(v["ipv4"])} dev "$n"']
+        if "gateway" in v or "metric" in v:
+            out.append('old=$(ip route show default dev "$n" 2>/dev/null | head -n 1)')
+            if "gateway" in v and not v["gateway"]:
+                out.append('[ -n "$old" ] && run ip route del default dev "$n"')
+            else:
+                gw = _sh(v["gateway"]) if v.get("gateway") else \
+                    '"$(printf \'%s\' "$old" | awk \'{ print $3 }\')"'
+                metric = f" metric {int(v['metric'])}" if v.get("metric") else ""
+                out += [f"gw={gw}",
+                        '[ -n "$gw" ] || fail "a metric on Linux belongs to a route, and this interface has no default route"',
+                        'ip route del default dev "$n" 2>/dev/null',
+                        f'ip route add default via "$gw" dev "$n"{metric} 2>/dev/null || '
+                        '{ [ -n "$old" ] && ip route add $old; fail "the default route could not be set"; }']
+        if "dns" in v:
+            out += ['command -v resolvectl >/dev/null 2>&1 || '
+                    'fail "DNS can only be set here through systemd-resolved, which this host does not run"',
+                    'run resolvectl dns "$n" ' + " ".join(_sh(d) for d in v["dns"])]
+    return "\n".join(out)
+
+
+def _change_passes(changes, platform):
+    """The passes that make `changes`, in order, ready to send."""
+    fam = _family(platform)
+    passes = []
+    for i, c in enumerate(changes):
+        if fam == "win":
+            body = _WIN_CHANGE.replace("__BODY__", _win_body(c))
+        else:
+            body = _SH_CHANGE.replace("__BODY__", _sh_body(c))
+        passes.append(_ready(f"change {i + 1}", platform, body.replace("__I__", str(i))))
+    return passes
+
+
+def _uplink(hid):
+    """The interface this host was last seen reaching the network through."""
+    with _lock:
+        read = dict(_reads.get(hid) or {})
+    for r in read.get("ifaces") or []:
+        if r.get("up") and r.get("gateway"):
+            return r["iface"]
+    return None
+
+
+@m.method("check")
+def check(params, host):
+    """Check drafted changes without sending anything: the host panel asks this
+    as each change is drafted, so a mistyped address is caught then, not at Apply.
+
+    ``{"platform", "changes": [...]}`` -> ``{"ok", "changes", "said", "error"}``,
+    where ``changes`` are the same changes made exact and ``said`` is what each
+    does, in words.
+    """
+    _sync_locale()
+    try:
+        done = [_normalize(c, params.get("platform")) for c in params.get("changes") or []]
+    except _Bad as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "changes": [c for c, _ in done], "said": [s for _, s in done]}
+
+
+@m.method("change")
+def change(params, host):
+    """Make drafted changes on one host, then read it again.
+
+    ``{"id", "hostname", "platform", "changes": [...]}``. Every change is
+    checked before anything is sent; one that fails stops the lot, and the
+    host is not touched. Changes to the interface the host reaches the network
+    through go last: if one of them cuts it off, everything else has been done.
+
+    Returns at once, as `read_host` does — ``{"state": "scanning"}`` — and the
+    caller polls `read_host`. Its answer, when done, carries ``outcome``: what
+    was applied and what was not, once.
+    """
+    _sync_locale()
+    hid = str(params.get("id") or "")
+    platform = params.get("platform") or ""
+    try:
+        done = [_normalize(c, platform) for c in params.get("changes") or []]
+        if not hid or not done:
+            raise _Bad(t("change.nothing"))
+        way_out = _uplink(hid)
+        done.sort(key=lambda cs: cs[0].get("iface") == way_out and way_out is not None)
+        passes = _change_passes([_complete(c, hid) if _family(platform) == "win" else c
+                                 for c, _ in done], platform)
+    except _Bad as exc:
+        return {"state": "invalid", "error": str(exc)}
+    with _lock:
+        if (_reads.get(hid) or {}).get("state") == "scanning":
+            return {"state": "invalid", "error": t("change.busy")}
+    try:
+        token, base = _auth(host)
+    except Exception as exc:  # noqa: BLE001
+        host.log(f"cs-network: auth failed: {exc}")
+        return {"state": "failed", "error": str(exc)}
+    plan = [s for _, s in done]
+    hostname = params.get("hostname") or hid
+    with _lock:
+        _reads[hid] = {"state": "scanning", "at": 0.0, "started": time.time(),
+                       "doing": "change", "platform": platform}
+
+    def run():
+        result = _read(hid, hostname, platform, token, base, threading.Event(),
+                       before=passes)
+        result["at"] = time.time()
+        result["platform"] = platform
+        result["outcome"] = _outcome(plan, result.pop("changed", []),
+                                     result.pop("change_failed", {}))
+        for i, err in sorted(result["outcome"]["failed"].items()):
+            result.setdefault("notes", []).append(
+                t("change.failed_one", what=plan[i], err=err))
+        with _lock:
+            _reads[hid] = result
+
+    threading.Thread(target=run, name=f"cs-network-change-{hid}", daemon=True).start()
+    host.log(f"cs-network: changing {hostname}: " + "; ".join(plan))
+    return {"state": "scanning", "elapsed": 0, "doing": "change"}
+
+
+def _outcome(plan, changed, failed):
+    """How a set of changes went: what was applied, and why the rest was not.
+
+    A change that reported neither is a failure too — the session ended before
+    it answered, which is what cutting a host off looks like from here.
+    """
+    failed = {int(i): err for i, err in failed.items()}
+    for i in range(len(plan)):
+        if i not in changed and i not in failed:
+            failed[i] = t("change.no_answer")
+    ok = len(plan) - len(failed)
+    if not failed:
+        level, text = "ok", t("change.all_applied", n=ok)
+    elif ok:
+        level, text = "warning", t("change.some_applied", ok=ok, n=len(plan))
+    else:
+        level, text = "error", t("change.none_applied")
+    return {"level": level, "text": text, "failed": failed}
+
+
+@m.method("read_host")
+def read_host(params, host):
+    """One host's interfaces, read on request — for the host panel.
+
+    ``{"id", "hostname", "platform"}``, as the ``crowdstrike`` inventory gives
+    them. ``"refresh": true`` reads the host again; ``"start": false`` only says
+    what is already known, for a host that is offline and cannot be asked.
+
+    Returns at once. A read takes seconds, so this starts it and answers
+    ``{"state": "scanning", "elapsed": seconds}``; the caller asks again until it
+    is ``done``, ``failed`` or ``skipped``. A finished read is kept, and answered
+    from until a refresh — a failure too, so that a caller that polls does not
+    start a new read on every frame of a screen that shows the error.
+
+    A ``done`` answer is ready to show, in the language Limen is in: a
+    ``headline``, and ``groups`` — the interfaces that are up, then the ones that
+    are not — each with a ``title``, its ``columns`` and ``rows``, and the line to
+    show instead when it has none (``empty``). ``at`` is when it was read, and
+    ``ifaces`` holds every interface as data.
+    """
+    _sync_locale()
+    hid = str(params.get("id") or "")
+    if not hid:
+        return {"state": "failed", "error": "no host id"}
+    with _lock:
+        known = dict(_reads.get(hid) or {})
+        # What a set of changes did is said once: the first answer after it
+        # carries it, and the screens after that do not say it again.
+        if known.get("outcome") and not known.get("reported") and known["state"] != "scanning":
+            _reads[hid]["reported"] = True
+        else:
+            known.pop("outcome", None)
+    if known and (known["state"] == "scanning" or not params.get("refresh")):
+        return _read_answer(known)
+    if not params.get("start", True):
+        return _read_answer(known) if known else {"state": "none"}
+
+    # The token is fetched here, on the dispatch thread, as for a fleet scan.
+    try:
+        token, base = _auth(host)
+    except Exception as exc:  # noqa: BLE001
+        host.log(f"cs-network: auth failed: {exc}")
+        return {"state": "failed", "error": str(exc)}
+    hostname = params.get("hostname") or hid
+    platform = params.get("platform") or ""
+    with _lock:
+        _reads[hid] = {"state": "scanning", "at": 0.0, "started": time.time(),
+                       "platform": platform}
+
+    def run():
+        done = _read(hid, hostname, platform, token, base, threading.Event())
+        done["at"] = time.time()
+        done["platform"] = platform
+        done.pop("changed", None)
+        done.pop("change_failed", None)
+        with _lock:
+            _reads[hid] = done
+
+    threading.Thread(target=run, name=f"cs-network-read-{hid}", daemon=True).start()
+    host.log(f"cs-network: reading {hostname} for another module")
+    return {"state": "scanning", "elapsed": 0}
+
+
+def _read_answer(read):
+    """What `read_host` says about a read, ready to show."""
+    out = {
+        "state": read["state"],
+        "at": read.get("at", 0.0),
+        "error": read.get("error", ""),
+        "notes": list(read.get("notes", [])),
+    }
+    if read["state"] == "scanning":
+        # How long it has been going, so a screen waiting on it can say so —
+        # an RTR read takes tens of seconds, and a still screen reads as stuck.
+        out["elapsed"] = int(time.time() - read.get("started", time.time()))
+        if read.get("doing"):
+            out["doing"] = read["doing"]
+    if read.get("outcome"):
+        out["outcome"] = {"level": read["outcome"]["level"], "text": read["outcome"]["text"]}
+    if read["state"] == "done":
+        ifaces = read["ifaces"]
+        up = [_cells(r) for r in ifaces if r["up"]]
+        down = [_cells(r) for r in ifaces if not r["up"]]
+        # What can be changed on this host, so a caller offers only that.
+        out["actions"] = actions_for(read.get("platform"))
+        out["headline"] = t("host.summary", n=len(ifaces))
+        # Up first: the shorter list, and the one carrying traffic. Down and
+        # virtual interfaces are listed rather than dropped — one that should
+        # not exist is a finding, and it cannot be one if it is never shown.
+        out["groups"] = [
+            {"title": t("host.up", n=len(up)), "columns": columns(), "rows": up,
+             "empty": t("host.nothing_up"),
+             "keys": [r["iface"] for r in ifaces if r["up"]]},
+            {"title": t("host.notup", n=len(down)), "columns": columns(), "rows": down,
+             "empty": t("host.everything_up"),
+             "keys": [r["iface"] for r in ifaces if not r["up"]]},
+        ]
+        out["ifaces"] = [{k: r.get(k) for k in (
+            "iface", "kind", "mac", "ipv4", "ipv6", "gateway", "dns", "state", "speed",
+            "up", "profile", "metric", "auto_metric", "dhcp", "dns_auto",
+            "saved", "cfg_ipv4", "cfg_gateway", "cfg_dns")} for r in ifaces]
+    return out
 
 
 @m.method("about")

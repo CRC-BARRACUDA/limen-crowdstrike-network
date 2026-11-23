@@ -22,10 +22,12 @@ crowdstrike = "CRC-BARRACUDA/limen-crowdstrike"
 [permissions]
 # Reaches the Falcon API directly (RTR endpoints).
 network = ["*.crowdstrike.com"]
-# Runs an enumeration script on remote fleet hosts. The scripts only read the
-# interface tables and change nothing — but "read-only" is a property of the
-# script, not of the permission, so the permission stays the honest one: this
-# executes code on your fleet.
+# Runs scripts on remote fleet hosts. The fleet scan only reads the interface
+# tables. The host panel can also ask it to CHANGE interfaces — addresses,
+# gateways, DNS, metrics, network profiles; disconnect, connect, delete and
+# create them — and it does, after the user has drafted the changes and
+# accepted a window listing every one. This executes code on your fleet, and
+# some of it changes how a host reaches the network.
 run_hosts = true
 
 # Deliberately NOT here:
