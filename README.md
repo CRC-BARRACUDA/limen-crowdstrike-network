@@ -124,6 +124,18 @@ It reports the last scan rather than starting one: a scan runs across the fleet
 and takes minutes, which is not something another module should set off by asking
 a question.
 
+## Reports
+
+With a report provider installed — the
+[`report`](https://github.com/CRC-BARRACUDA/limen-report) module — a **Make
+Report** button appears: on the fleet screen for everything the last scan read,
+with a table per host and a list of the hosts that were not read; and in a
+host's tab for that host alone, as the tab shows it, filter included.
+
+The button opens the provider's preview. What the document is, the ground it is
+printed on and whether it is signed with your OpenPGP key are chosen there. A
+host's report is filed under the host's name.
+
 ## Licence
 
 GPL-3.0-or-later.

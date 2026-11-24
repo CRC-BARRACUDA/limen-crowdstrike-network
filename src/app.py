@@ -35,6 +35,18 @@ def _sync_locale():
 CAP = "crowdstrike.network"
 m = Module("crowdstrike-network", [CAP])
 
+
+def has_reports():
+    """Whether a report provider is installed right now.
+
+    Asked each draw rather than cached: `report.build` is optional, and a module
+    installed while this tab is open should make the button appear.
+    """
+    try:
+        return m.host.has_capability("report.build")
+    except Exception:  # noqa: BLE001
+        return False
+
 # The fetched inventory. Held so reopening the tab restores the list rather than
 # re-querying the fleet.
 _hosts = {"rows": None}

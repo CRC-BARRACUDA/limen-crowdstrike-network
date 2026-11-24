@@ -26,6 +26,7 @@ col_host = "Хост"
 col_why = "Причина"
 shown_of = "показано {shown} з {total}"
 no_match = "Нічого не знайдено."
+report = "Створити звіт"
 
 [state]
 queued = "очікує"
@@ -89,6 +90,22 @@ falcon_id = "Ідентифікатор хоста Falcon"
 col_ifaces = "Інтерфейсів"
 col_up = "Активних"
 col_addrs = "Адрес"
+
+# Звіт, коли встановлено модуль звітів.
+[report]
+title = "Звіт про мережу парку"
+subtitle_fleet = "хостів: {hosts} · інтерфейсів: {n} · активних: {up}"
+subtitle_host = "{host} · інтерфейсів: {n} · активних: {up}"
+host_section = "{host} — інтерфейсів: {n}"
+by_type = "Інтерфейси за типом"
+line_hosts = "Зчитано хостів: {n}"
+line_ifaces = "Інтерфейсів: {n}"
+line_up = "Активних: {n}"
+line_down = "Неактивних: {n}"
+line_not_read = "Не зчитано хостів: {n}"
+nothing = "Ще нічого не проскановано."
+written = "Звіт записано"
+failed = "Не вдалося створити звіт"
 
 [note]
 truncated = "понад {n} інтерфейсів — список скорочено"
