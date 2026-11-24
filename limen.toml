@@ -1,7 +1,7 @@
 [module]
 name = "crowdstrike-network"
 display_name = "Fleet network"
-version = "0.1.0"
+version = "0.2.0"
 language = "python"
 entry = "src/main.py"
 description = "List the network interfaces on CrowdStrike fleet hosts over RTR — addresses, MACs, gateways, DNS and link state, per host."
