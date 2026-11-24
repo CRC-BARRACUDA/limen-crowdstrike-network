@@ -12,7 +12,7 @@ from limen_sdk import (
     Window,
 )
 
-from app import CAP, _hosts, _jobs, _lock, _status, _sync_locale, m, t
+from app import CAP, _hosts, _jobs, _lock, _status, _sync_locale, has_reports, m, t
 from scan import _busy
 
 
@@ -87,13 +87,19 @@ def open_host(params, host):
     ]
     for note in job["notes"]:
         widgets.append(Label("! " + note, style="weak"))
-    widgets.append(Row([
+    tools = [
         Text("query", label=t("ui.search"), placeholder=t("ui.search_hint"),
              default=_query.get(hid, "")),
         # Re-opens this same tab with the filter applied; the host id rides along
         # so the button knows which host it is filtering.
         Button(t("ui.filter"), calls="open_host", args={"id": hid}),
-    ]))
+    ]
+    if has_reports():
+        # This host alone, as this tab shows it. Not `open_in_tab`: the report
+        # provider answers with a pop-up, and one opened into a tab of its own
+        # leaves that tab empty.
+        tools.append(Button(t("ui.report"), calls="make_report", args={"id": hid}))
+    widgets.append(Row(tools))
     if query:
         widgets.append(Label(t("ui.shown_of", shown=len(up) + len(down),
                                  total=len(ifaces)), style="weak"))
@@ -273,6 +279,12 @@ def ui():
         # that does nothing.
         if running:
             toolbar.append(Button(t("ui.stop"), calls="stop", danger=True))
+    # Offered once a scan has something to say, and not while one is running:
+    # a report of half a fleet reads like a report of the fleet.
+    with _lock:
+        scanned = any(j["state"] in ("done", "failed", "skipped") for j in _jobs.values())
+    if scanned and has_reports():
+        toolbar.append(Button(t("ui.report"), calls="make_report", enabled=not running))
     widgets.append(Row(toolbar))
 
     if _status["msg"]:

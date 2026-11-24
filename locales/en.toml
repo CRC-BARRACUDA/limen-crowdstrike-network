@@ -25,6 +25,7 @@ col_host = "Host"
 col_why = "Why"
 shown_of = "{shown} of {total} shown"
 no_match = "Nothing matches that search."
+report = "Make Report"
 
 [state]
 queued = "waiting"
@@ -88,6 +89,22 @@ falcon_id = "Falcon host id"
 col_ifaces = "Interfaces"
 col_up = "Up"
 col_addrs = "Addresses"
+
+# The report, when a report provider is installed.
+[report]
+title = "Fleet Network Report"
+subtitle_fleet = "{hosts} host(s) · {n} interface(s) · {up} up"
+subtitle_host = "{host} · {n} interface(s) · {up} up"
+host_section = "{host} — {n} interface(s)"
+by_type = "Interfaces by type"
+line_hosts = "Hosts read: {n}"
+line_ifaces = "Interfaces: {n}"
+line_up = "Up: {n}"
+line_down = "Not up: {n}"
+line_not_read = "Hosts not read: {n}"
+nothing = "Nothing has been scanned yet."
+written = "Report written"
+failed = "Couldn't build the report"
 
 [note]
 truncated = "more than {n} interfaces — list cut short"

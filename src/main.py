@@ -49,6 +49,7 @@ Methods
   read_host       -> read one host on request, for the host panel
   check           -> check drafted interface changes, sending nothing
   change          -> make drafted interface changes on one host, then read it
+  make_report     -> the last scan, or one host of it, handed to a report provider
 """
 
 # Each file registers its own methods on `m` when it is imported. Nothing
@@ -56,6 +57,7 @@ Methods
 # a second module.
 import api  # noqa: F401
 import change  # noqa: F401
+import report  # noqa: F401
 import scan  # noqa: F401
 import view  # noqa: F401
 from app import m
